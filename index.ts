@@ -1,15 +1,26 @@
 import { MCPServer, text, widget, error } from "mcp-use/server";
 import { z } from "zod";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+const DEFAULT_PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const DEFAULT_HOST = process.env.HOST || "0.0.0.0";
+process.env.HOST = DEFAULT_HOST;
+process.env.PORT = String(DEFAULT_PORT);
+
+const baseUrl =
+  process.env.MCP_URL ||
+  process.env.MCP_WEB_URL ||
+  process.env.MCP_BASE_URL ||
+  `http://localhost:${DEFAULT_PORT}`;
 
 const server = new MCPServer({
   name: "vector-lens",
   title: "Vector Lens",
   version: "1.0.0",
   description: "Visual RAG retrieval inspector for ML engineers",
-  baseUrl: process.env.MCP_URL || "http://localhost:3000",
+  baseUrl,
   favicon: "favicon.ico",
   icons: [{ src: "icon.svg", mimeType: "image/svg+xml", sizes: ["512x512"] }],
 });
@@ -265,9 +276,17 @@ function projectPoint(
 
 function loadArxivPapers(): ArxivPaper[] {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const datasetPath = path.join(here, "data", "arxiv-ml-500.json");
+  const candidatePaths = [
+    path.join(here, "data", "arxiv-ml-500.json"),
+    path.join(here, "..", "data", "arxiv-ml-500.json"),
+    path.join(process.cwd(), "data", "arxiv-ml-500.json"),
+  ];
+  const datasetPath = candidatePaths.find((candidate) => existsSync(candidate));
 
   try {
+    if (!datasetPath) {
+      throw new Error(`Checked paths: ${candidatePaths.join(", ")}`);
+    }
     const raw = readFileSync(datasetPath, "utf8");
     const parsed = JSON.parse(raw) as ArxivPaper[];
     if (!Array.isArray(parsed) || parsed.length === 0) {
@@ -486,6 +505,5 @@ server.tool(
   }
 );
 
-const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
-console.log(`Server running on port ${PORT}`);
-server.listen(PORT);
+console.log(`Server running on ${DEFAULT_HOST}:${DEFAULT_PORT}`);
+server.listen();
