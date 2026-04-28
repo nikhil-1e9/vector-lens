@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useCallback } from "react";
+import { useState, useMemo, useRef, useCallback, useEffect } from "react";
 import {
   McpUseProvider,
   useWidget,
@@ -18,7 +18,11 @@ const propsSchema = z.object({
       source: z.string(),
       year: z.number(),
       authors: z.string(),
+      topics: z.array(z.string()),
       similarity: z.number(),
+      denseScore: z.number(),
+      lexicalScore: z.number(),
+      topicOverlap: z.number(),
     })
   ),
   spacePoints: z.array(
@@ -28,10 +32,14 @@ const propsSchema = z.object({
       y: z.number(),
       sim: z.number(),
       isTopK: z.boolean(),
+      source: z.string(),
+      year: z.number(),
+      topics: z.array(z.string()),
+      rank: z.number().nullable(),
       preview: z.string(),
     })
   ),
-  queryPoint: z.object({ x: z.number(), y: z.number() }),
+  queryPoint: z.object({ x: z.number(), y: z.number(), topics: z.array(z.string()) }),
   stats: z.object({
     indexSize: z.number(),
     embeddingDim: z.number(),
@@ -39,6 +47,8 @@ const propsSchema = z.object({
     latencyMs: z.number(),
     top1Sim: z.number(),
     topKSimGap: z.number(),
+    scoringMode: z.string(),
+    matchedTopics: z.array(z.string()),
   }),
   histBins: z.array(z.number()),
   modelName: z.string(),
@@ -110,10 +120,14 @@ function highlightText(
 function ScatterPlot({
   points,
   queryPoint,
+  selectedId,
+  onSelect,
   colors,
 }: {
   points: Props["spacePoints"];
   queryPoint: Props["queryPoint"];
+  selectedId: string | null;
+  onSelect: (id: string) => void;
   colors: ReturnType<typeof useColors>;
 }) {
   const svgRef = useRef<SVGSVGElement>(null);
@@ -144,14 +158,18 @@ function ScatterPlot({
     };
   }, [points, queryPoint]);
 
-  // Initialize viewBox
-  useMemo(() => {
+  useEffect(() => {
     if (viewBox.w === 0) setViewBox(bounds);
   }, [bounds, viewBox.w]);
 
   const vb = viewBox.w > 0 ? viewBox : bounds;
   const WIDTH = 600;
   const HEIGHT = 400;
+  const topKPoints = useMemo(() => points.filter((p) => p.isTopK), [points]);
+  const selectedPoint = useMemo(
+    () => points.find((point) => point.id === selectedId) ?? null,
+    [points, selectedId]
+  );
 
   const toSvgX = useCallback(
     (px: number) => ((px - vb.x) / vb.w) * WIDTH,
@@ -209,8 +227,60 @@ function ScatterPlot({
 
   const handleMouseUp = useCallback(() => setIsPanning(false), []);
 
+  const resetView = useCallback(() => setViewBox(bounds), [bounds]);
+
+  const focusTopK = useCallback(() => {
+    const focusPoints = [...topKPoints, { ...queryPoint, id: "query" }];
+    const allX = focusPoints.map((point) => point.x);
+    const allY = focusPoints.map((point) => point.y);
+    const minX = Math.min(...allX);
+    const maxX = Math.max(...allX);
+    const minY = Math.min(...allY);
+    const maxY = Math.max(...allY);
+    const padX = (maxX - minX) * 0.45 || 1.2;
+    const padY = (maxY - minY) * 0.45 || 1.2;
+    setViewBox({
+      x: minX - padX,
+      y: minY - padY,
+      w: maxX - minX + padX * 2,
+      h: maxY - minY + padY * 2,
+    });
+  }, [queryPoint, topKPoints]);
+
   return (
     <div style={{ position: "relative" }}>
+      <div
+        style={{
+          position: "absolute",
+          top: 12,
+          left: 12,
+          display: "flex",
+          gap: 8,
+          zIndex: 2,
+        }}
+      >
+        {[
+          { label: "Reset view", onClick: resetView },
+          { label: "Focus top-k", onClick: focusTopK },
+        ].map((action) => (
+          <button
+            key={action.label}
+            onClick={action.onClick}
+            style={{
+              border: `1px solid ${colors.border}`,
+              backgroundColor: colors.toolbarBg,
+              color: colors.text,
+              borderRadius: 999,
+              padding: "6px 10px",
+              fontSize: 11,
+              cursor: "pointer",
+              backdropFilter: "blur(10px)",
+            }}
+          >
+            {action.label}
+          </button>
+        ))}
+      </div>
       <svg
         ref={svgRef}
         width="100%"
@@ -222,6 +292,7 @@ function ScatterPlot({
           border: `1px solid ${colors.border}`,
           cursor: isPanning ? "grabbing" : "grab",
           userSelect: "none",
+          boxShadow: "inset 0 1px 0 rgba(255,255,255,0.06)",
         }}
         onWheel={handleWheel}
         onMouseDown={handleMouseDown}
@@ -231,7 +302,17 @@ function ScatterPlot({
           handleMouseUp();
           setTooltip(null);
         }}
+        onDoubleClick={resetView}
       >
+        <defs>
+          <radialGradient id="vector-lens-glow" cx="50%" cy="50%" r="70%">
+            <stop offset="0%" stopColor={colors.plotGlow} stopOpacity="0.32" />
+            <stop offset="100%" stopColor={colors.plotGlow} stopOpacity="0" />
+          </radialGradient>
+        </defs>
+
+        <rect x={0} y={0} width={WIDTH} height={HEIGHT} fill="url(#vector-lens-glow)" />
+
         {/* Grid lines */}
         {[0.25, 0.5, 0.75].map((frac) => (
           <g key={frac}>
@@ -254,6 +335,20 @@ function ScatterPlot({
           </g>
         ))}
 
+        {topKPoints.map((point) => (
+          <line
+            key={`link-${point.id}`}
+            x1={toSvgX(queryPoint.x)}
+            y1={toSvgY(queryPoint.y)}
+            x2={toSvgX(point.x)}
+            y2={toSvgY(point.y)}
+            stroke={colors.linkLine}
+            strokeDasharray="5 5"
+            strokeWidth={point.rank === 1 ? 1.8 : 1}
+            opacity={point.rank === 1 ? 0.8 : 0.45}
+          />
+        ))}
+
         {/* Background points */}
         {points
           .filter((p) => !p.isTopK)
@@ -265,6 +360,7 @@ function ScatterPlot({
               r={2.5}
               fill={colors.dotGrey}
               opacity={0.4}
+              onClick={() => onSelect(p.id)}
               onMouseEnter={(e) => {
                 const rect = svgRef.current?.getBoundingClientRect();
                 if (rect) {
@@ -289,17 +385,18 @@ function ScatterPlot({
               cx={toSvgX(p.x)}
               cy={toSvgY(p.y)}
               r={4 + p.sim * 8}
-              fill="#f97316"
+              fill={p.rank === 1 ? colors.hot : colors.warm}
               opacity={0.85}
-              stroke="#fff"
-              strokeWidth={1}
+              stroke={selectedId === p.id ? colors.selection : "#fff"}
+              strokeWidth={selectedId === p.id ? 2.5 : 1.25}
+              onClick={() => onSelect(p.id)}
               onMouseEnter={(e) => {
                 const rect = svgRef.current?.getBoundingClientRect();
                 if (rect) {
                   setTooltip({
                     x: e.clientX - rect.left,
                     y: e.clientY - rect.top - 10,
-                    text: `[${p.sim.toFixed(3)}] ${p.preview}`,
+                    text: `#${p.rank ?? "?"} [${p.sim.toFixed(3)}] ${p.source}\n${p.preview}`,
                   });
                 }
               }}
@@ -307,6 +404,18 @@ function ScatterPlot({
               style={{ cursor: "crosshair" }}
             />
           ))}
+
+        {selectedPoint && (
+          <circle
+            cx={toSvgX(selectedPoint.x)}
+            cy={toSvgY(selectedPoint.y)}
+            r={14}
+            fill="none"
+            stroke={colors.selection}
+            strokeWidth={2}
+            opacity={0.95}
+          />
+        )}
 
         {/* Query point (glowing blue) */}
         <circle
@@ -325,29 +434,54 @@ function ScatterPlot({
           strokeWidth={2}
         />
 
+        {topKPoints.slice(0, 3).map((point) => (
+          <text
+            key={`label-${point.id}`}
+            x={toSvgX(point.x) + 8}
+            y={toSvgY(point.y) - 8}
+            fontSize={11}
+            fontWeight={700}
+            fill={colors.text}
+            style={{ pointerEvents: "none" }}
+          >
+            #{point.rank}
+          </text>
+        ))}
+
         {/* Legend */}
-        <g transform={`translate(${WIDTH - 155}, 14)`}>
+        <g transform={`translate(${WIDTH - 168}, 16)`}>
           <rect
             x={0}
             y={0}
-            width={145}
-            height={70}
-            rx={4}
-            fill={colors.plotBg}
-            opacity={0.9}
+            width={154}
+            height={86}
+            rx={10}
+            fill={colors.toolbarBg}
+            opacity={0.95}
             stroke={colors.border}
           />
-          <circle cx={14} cy={16} r={5} fill={colors.accent} />
-          <text x={26} y={20} fontSize={11} fill={colors.textSecondary}>
+          <circle cx={16} cy={18} r={5} fill={colors.accent} />
+          <text x={28} y={22} fontSize={11} fill={colors.textSecondary}>
             Query
           </text>
-          <circle cx={14} cy={34} r={5} fill="#f97316" />
-          <text x={26} y={38} fontSize={11} fill={colors.textSecondary}>
+          <circle cx={16} cy={38} r={5} fill={colors.warm} />
+          <text x={28} y={42} fontSize={11} fill={colors.textSecondary}>
             Top-K results
           </text>
-          <circle cx={14} cy={52} r={3} fill={colors.dotGrey} opacity={0.6} />
-          <text x={26} y={56} fontSize={11} fill={colors.textSecondary}>
+          <circle cx={16} cy={58} r={3} fill={colors.dotGrey} opacity={0.6} />
+          <text x={28} y={62} fontSize={11} fill={colors.textSecondary}>
             Index chunks
+          </text>
+          <line
+            x1={16}
+            y1={74}
+            x2={28}
+            y2={74}
+            stroke={colors.linkLine}
+            strokeDasharray="4 4"
+          />
+          <text x={34} y={78} fontSize={11} fill={colors.textSecondary}>
+            Query-to-neighbor links
           </text>
         </g>
       </svg>
@@ -468,20 +602,26 @@ function useColors() {
   const theme = useWidgetTheme();
   const isDark = theme === "dark";
   return {
-    bg: isDark ? "#0f1117" : "#f8f9fb",
-    cardBg: isDark ? "#1a1d27" : "#ffffff",
-    text: isDark ? "#e2e4e9" : "#1a1d27",
-    textSecondary: isDark ? "#8b8fa3" : "#6b7280",
-    border: isDark ? "#2a2d3a" : "#e2e5ea",
-    accent: "#3b82f6",
-    accentLight: isDark ? "rgba(59,130,246,0.15)" : "rgba(59,130,246,0.08)",
-    plotBg: isDark ? "#13151d" : "#f0f2f5",
-    gridLine: isDark ? "#1e2130" : "#e0e3e8",
-    dotGrey: isDark ? "#555" : "#aaa",
-    tooltipBg: isDark ? "#1a1d27" : "#fff",
-    tabActive: isDark ? "#1a1d27" : "#fff",
-    tabInactive: isDark ? "#0f1117" : "#f0f2f5",
-    inputBg: isDark ? "#1a1d27" : "#fff",
+    bg: isDark ? "#0d1018" : "#f4f6fb",
+    cardBg: isDark ? "#171b26" : "#ffffff",
+    text: isDark ? "#e5e9f5" : "#162033",
+    textSecondary: isDark ? "#93a0ba" : "#637189",
+    border: isDark ? "#273149" : "#d9e0ef",
+    accent: "#2f7df6",
+    accentLight: isDark ? "rgba(47,125,246,0.18)" : "rgba(47,125,246,0.08)",
+    plotBg: isDark ? "#101624" : "#edf3ff",
+    plotGlow: isDark ? "#2f7df6" : "#69a5ff",
+    gridLine: isDark ? "#20283a" : "#d5deef",
+    dotGrey: isDark ? "#5f6c85" : "#98a4b6",
+    tooltipBg: isDark ? "#141a27" : "#ffffff",
+    tabActive: isDark ? "#171b26" : "#ffffff",
+    tabInactive: isDark ? "#101624" : "#edf3ff",
+    inputBg: isDark ? "#171b26" : "#ffffff",
+    toolbarBg: isDark ? "rgba(23,27,38,0.86)" : "rgba(255,255,255,0.88)",
+    warm: "#fb923c",
+    hot: "#f97316",
+    selection: "#14b8a6",
+    linkLine: isDark ? "rgba(99,179,237,0.55)" : "rgba(59,130,246,0.42)",
   };
 }
 
@@ -495,14 +635,15 @@ export default function VectorLens() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchK, setSearchK] = useState(5);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+  const [selectedPointId, setSelectedPointId] = useState<string | null>(null);
 
-  // Sync search inputs from props
-  useMemo(() => {
+  useEffect(() => {
     if (!isPending) {
       setSearchQuery(props.query);
       setSearchK(props.k);
+      setSelectedPointId(props.results[0]?.id ?? null);
     }
-  }, [isPending, props.query, props.k]);
+  }, [isPending, props.query, props.k, props.results]);
 
   if (isPending) {
     return (
@@ -585,20 +726,22 @@ export default function VectorLens() {
         {/* Header */}
         <div
           style={{
-            padding: "16px 20px",
+            padding: "18px 20px",
             borderBottom: `1px solid ${colors.border}`,
             display: "flex",
             alignItems: "center",
             gap: 16,
             flexWrap: "wrap",
+            background:
+              "linear-gradient(135deg, rgba(47,125,246,0.08), rgba(20,184,166,0.05) 45%, transparent 80%)",
           }}
         >
           <div style={{ flex: "1 1 auto" }}>
             <div
               style={{
-                fontSize: 16,
+                fontSize: 18,
                 fontWeight: 700,
-                letterSpacing: "-0.01em",
+                letterSpacing: "-0.03em",
               }}
             >
               Vector Lens
@@ -611,8 +754,7 @@ export default function VectorLens() {
                 ...mono,
               }}
             >
-              {props.datasetName} | {props.stats.indexSize} chunks |{" "}
-              {props.modelName}
+              {props.datasetName} | {props.stats.indexSize} chunks | {props.modelName}
             </div>
           </div>
           <button
@@ -793,11 +935,11 @@ export default function VectorLens() {
                         marginBottom: 8,
                       }}
                     >
-                      <span
-                        style={{
-                          ...mono,
-                          fontSize: 12,
-                          fontWeight: 700,
+                        <span
+                          style={{
+                            ...mono,
+                            fontSize: 12,
+                            fontWeight: 700,
                           color: simColor(r.similarity),
                           backgroundColor: simBgColor(r.similarity),
                           padding: "2px 8px",
@@ -824,6 +966,25 @@ export default function VectorLens() {
                       >
                         {r.id}
                       </span>
+                      <button
+                        onClick={() => {
+                          setSelectedPointId(r.id);
+                          setTab("embedding");
+                        }}
+                        style={{
+                          marginLeft: "auto",
+                          border: `1px solid ${colors.border}`,
+                          backgroundColor:
+                            selectedPointId === r.id ? colors.accentLight : colors.cardBg,
+                          color: colors.textSecondary,
+                          borderRadius: 999,
+                          padding: "4px 10px",
+                          fontSize: 11,
+                          cursor: "pointer",
+                        }}
+                      >
+                        Locate in space
+                      </button>
                     </div>
 
                     {/* Text */}
@@ -854,11 +1015,55 @@ export default function VectorLens() {
                         display: "flex",
                         gap: 12,
                         flexWrap: "wrap",
+                        alignItems: "center",
                       }}
                     >
                       <span style={{ fontWeight: 600 }}>{r.source}</span>
                       <span style={mono}>{r.year}</span>
                       <span>{r.authors}</span>
+                      {r.topics.map((topic) => (
+                        <span
+                          key={`${r.id}-${topic}`}
+                          style={{
+                            border: `1px solid ${colors.border}`,
+                            borderRadius: 999,
+                            padding: "2px 8px",
+                            backgroundColor: colors.bg,
+                          }}
+                        >
+                          {topic}
+                        </span>
+                      ))}
+                    </div>
+
+                    <div
+                      style={{
+                        marginTop: 10,
+                        display: "flex",
+                        gap: 8,
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      {[
+                        `dense ${r.denseScore.toFixed(3)}`,
+                        `lexical ${r.lexicalScore.toFixed(3)}`,
+                        `topic ${r.topicOverlap.toFixed(3)}`,
+                      ].map((chip) => (
+                        <span
+                          key={`${r.id}-${chip}`}
+                          style={{
+                            ...mono,
+                            fontSize: 11,
+                            color: colors.textSecondary,
+                            backgroundColor: colors.bg,
+                            border: `1px solid ${colors.border}`,
+                            borderRadius: 999,
+                            padding: "3px 8px",
+                          }}
+                        >
+                          {chip}
+                        </span>
+                      ))}
                     </div>
                   </div>
                 </div>
@@ -877,14 +1082,85 @@ export default function VectorLens() {
                   ...mono,
                 }}
               >
-                2D projection ({props.spacePoints.length} points) | Scroll to
-                zoom, drag to pan
+                2D semantic projection ({props.spacePoints.length} points) | Scroll to zoom,
+                drag to pan, double-click to reset
               </div>
               <ScatterPlot
                 points={props.spacePoints}
                 queryPoint={props.queryPoint}
+                selectedId={selectedPointId}
+                onSelect={setSelectedPointId}
                 colors={colors}
               />
+              {selectedPointId && (
+                <div
+                  style={{
+                    marginTop: 14,
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: 10,
+                    backgroundColor: colors.cardBg,
+                    padding: 16,
+                    boxShadow: "0 10px 30px rgba(15, 23, 42, 0.06)",
+                  }}
+                >
+                  {(() => {
+                    const point = props.spacePoints.find((entry) => entry.id === selectedPointId);
+                    if (!point) return null;
+                    return (
+                      <>
+                        <div
+                          style={{
+                            display: "flex",
+                            gap: 10,
+                            alignItems: "center",
+                            flexWrap: "wrap",
+                            marginBottom: 8,
+                          }}
+                        >
+                          <span
+                            style={{
+                              ...mono,
+                              color: point.isTopK ? colors.hot : colors.textSecondary,
+                              fontWeight: 700,
+                            }}
+                          >
+                            {point.isTopK ? `Top-${point.rank}` : "Indexed chunk"}
+                          </span>
+                          <span style={{ fontWeight: 700 }}>{point.source}</span>
+                          <span style={{ ...mono, color: colors.textSecondary }}>{point.year}</span>
+                        </div>
+                        <div
+                          style={{
+                            fontSize: 13,
+                            lineHeight: 1.6,
+                            color: colors.text,
+                            marginBottom: 10,
+                          }}
+                        >
+                          {point.preview}
+                        </div>
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                          {point.topics.map((topic) => (
+                            <span
+                              key={`${point.id}-${topic}`}
+                              style={{
+                                fontSize: 11,
+                                color: colors.textSecondary,
+                                border: `1px solid ${colors.border}`,
+                                borderRadius: 999,
+                                padding: "3px 8px",
+                                backgroundColor: colors.bg,
+                              }}
+                            >
+                              {topic}
+                            </span>
+                          ))}
+                        </div>
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
             </div>
           )}
 
@@ -976,6 +1252,49 @@ export default function VectorLens() {
                     </div>
                   </div>
                 ))}
+              </div>
+
+              <div
+                style={{
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: 6,
+                  backgroundColor: colors.cardBg,
+                  padding: 16,
+                  marginBottom: 14,
+                }}
+              >
+                <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
+                  Retrieval Mix
+                </div>
+                <div style={{ fontSize: 12, color: colors.textSecondary, ...mono }}>
+                  {props.stats.scoringMode}
+                </div>
+                {props.stats.matchedTopics.length > 0 && (
+                  <div
+                    style={{
+                      display: "flex",
+                      gap: 8,
+                      flexWrap: "wrap",
+                      marginTop: 10,
+                    }}
+                  >
+                    {props.stats.matchedTopics.map((topic) => (
+                      <span
+                        key={`matched-${topic}`}
+                        style={{
+                          fontSize: 11,
+                          color: colors.textSecondary,
+                          border: `1px solid ${colors.border}`,
+                          borderRadius: 999,
+                          padding: "3px 8px",
+                          backgroundColor: colors.bg,
+                        }}
+                      >
+                        query topic: {topic}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {/* Similarity distribution histogram */}

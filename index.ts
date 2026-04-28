@@ -1,5 +1,8 @@
 import { MCPServer, text, widget, error } from "mcp-use/server";
 import { z } from "zod";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const server = new MCPServer({
   name: "vector-lens",
@@ -23,8 +26,21 @@ interface Chunk {
   source: string;
   year: number;
   authors: string;
+  topics: string[];
   x: number;
   y: number;
+}
+
+interface ArxivPaper {
+  id: string;
+  title: string;
+  summary: string;
+  authors: string[];
+  categories: string[];
+  primaryCategory: string;
+  published: string;
+  updated: string;
+  url: string;
 }
 
 // Simple seeded PRNG
@@ -39,8 +55,6 @@ function mulberry32(seed: number) {
   };
 }
 
-const rng = mulberry32(SEED);
-
 // Hash a string to an integer
 function hashStr(s: string): number {
   let h = 0;
@@ -50,10 +64,31 @@ function hashStr(s: string): number {
   return Math.abs(h);
 }
 
+function tokenize(txt: string): string[] {
+  return txt
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function normalize(vec: number[]): number[] {
+  let norm = 0;
+  for (let i = 0; i < vec.length; i++) norm += vec[i] * vec[i];
+  norm = Math.sqrt(norm) || 1;
+  return vec.map((v) => v / norm);
+}
+
+function deterministicVector(key: string, dim = EMBEDDING_DIM): number[] {
+  const localRng = mulberry32(hashStr(`${SEED}:${key}`));
+  const vec = new Array(dim).fill(0).map(() => localRng() * 2 - 1);
+  return normalize(vec);
+}
+
 // Generate a deterministic embedding from text via bag-of-words hashing
-function embedText(txt: string): number[] {
+function embedTextResidual(txt: string): number[] {
   const vec = new Float64Array(EMBEDDING_DIM);
-  const words = txt.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(Boolean);
+  const words = tokenize(txt);
   for (const w of words) {
     const h = hashStr(w);
     const dim1 = h % EMBEDDING_DIM;
@@ -64,12 +99,9 @@ function embedText(txt: string): number[] {
     vec[dim3] += 0.25;
   }
   // Normalize to unit vector
-  let norm = 0;
-  for (let i = 0; i < EMBEDDING_DIM; i++) norm += vec[i] * vec[i];
-  norm = Math.sqrt(norm) || 1;
   const result: number[] = [];
-  for (let i = 0; i < EMBEDDING_DIM; i++) result.push(vec[i] / norm);
-  return result;
+  for (let i = 0; i < EMBEDDING_DIM; i++) result.push(vec[i]);
+  return normalize(result);
 }
 
 // Cosine similarity between two unit vectors
@@ -94,123 +126,236 @@ const topics = [
   "recommender system", "time series forecasting", "speech recognition",
 ];
 
-const methods = [
-  "We propose a novel approach that", "This paper introduces a new method which",
-  "We present an efficient framework that", "Our work demonstrates that",
-  "In this paper we develop a technique that", "We investigate how",
-  "This study explores the use of", "We design a scalable system that",
-  "Our approach leverages", "We introduce a principled method for",
-];
+const topicAliases: Record<string, string[]> = {
+  transformer: ["transformer", "transformers"],
+  "attention mechanism": ["attention", "attention mechanism", "self-attention"],
+  "self-supervised learning": ["self-supervised learning", "ssl"],
+  "contrastive learning": ["contrastive learning", "contrastive"],
+  "generative adversarial network": ["generative adversarial network", "gan", "gans"],
+  "diffusion model": ["diffusion", "diffusion model", "diffusion models"],
+  "reinforcement learning": ["reinforcement learning", "rl"],
+  "policy gradient": ["policy gradient", "policy gradients"],
+  "natural language processing": ["natural language processing", "nlp"],
+  "language model": ["language model", "llm", "language models"],
+  "computer vision": ["computer vision", "vision"],
+  "object detection": ["object detection", "detector"],
+  "image segmentation": ["image segmentation", "segmentation"],
+  "graph neural network": ["graph neural network", "graph neural networks", "gnn", "gnns"],
+  "federated learning": ["federated learning"],
+  "meta-learning": ["meta-learning", "metalearning"],
+  "few-shot learning": ["few-shot", "few-shot learning"],
+  "knowledge distillation": ["knowledge distillation", "distillation"],
+  "neural architecture search": ["neural architecture search", "nas"],
+  pruning: ["pruning", "sparsity"],
+  quantization: ["quantization", "quantized", "quantisation"],
+  "multi-modal learning": ["multimodal", "multi-modal", "multi-modal learning"],
+  "vision transformer": ["vision transformer", "vit"],
+  BERT: ["bert"],
+  GPT: ["gpt"],
+  "variational autoencoder": ["variational autoencoder", "vae"],
+  "normalizing flow": ["normalizing flow", "flows"],
+  "optimal transport": ["optimal transport"],
+  "causal inference": ["causal inference", "causality"],
+  "bayesian optimization": ["bayesian optimization"],
+  "active learning": ["active learning"],
+  "curriculum learning": ["curriculum learning"],
+  "data augmentation": ["data augmentation", "augmentation"],
+  "domain adaptation": ["domain adaptation"],
+  "transfer learning": ["transfer learning"],
+  "representation learning": ["representation learning", "embeddings"],
+  embedding: ["embedding", "embeddings", "vector search", "semantic search"],
+  "recommender system": ["recommender system", "recommendation"],
+  "time series forecasting": ["time series", "forecasting"],
+  "speech recognition": ["speech recognition", "asr"],
+};
 
-const results = [
-  "achieves state-of-the-art results on multiple benchmarks",
-  "outperforms existing baselines by a significant margin",
-  "reduces computational cost while maintaining accuracy",
-  "demonstrates strong generalization to unseen domains",
-  "shows consistent improvements across diverse tasks",
-  "yields competitive performance with fewer parameters",
-  "scales efficiently to large datasets",
-  "provides theoretical guarantees on convergence",
-  "enables real-time inference on edge devices",
-  "improves sample efficiency by an order of magnitude",
-];
+const categoryTopics: Record<string, string[]> = {
+  "cs.LG": ["representation learning", "transfer learning", "active learning"],
+  "stat.ML": ["bayesian optimization", "causal inference", "representation learning"],
+  "cs.AI": ["language model", "reinforcement learning", "graph neural network"],
+  "cs.CL": ["natural language processing", "language model", "BERT", "GPT"],
+  "cs.CV": ["computer vision", "object detection", "image segmentation", "vision transformer"],
+  "cs.NE": ["meta-learning", "few-shot learning", "knowledge distillation"],
+  "cs.IR": ["embedding", "recommender system"],
+  "cs.SD": ["speech recognition", "time series forecasting"],
+  "eess.AS": ["speech recognition"],
+};
 
-const firstNames = [
-  "Wei", "Yann", "Yoshua", "Geoffrey", "Ilya", "Kaiming", "Ashish", "Dario",
-  "Sergey", "Alex", "Ian", "Alec", "Oriol", "Jian", "Ross", "Andrej",
-  "Pieter", "Chelsea", "Sara", "Timnit", "Percy", "Christopher", "Jason",
-  "Jacob", "Samy", "Hugo", "Thomas", "Richard", "David", "Michael",
-];
+const topicBasis = new Map(
+  topics.map((topic) => [topic, deterministicVector(`topic:${topic}`)])
+);
 
-const lastNames = [
-  "Zhang", "LeCun", "Bengio", "Hinton", "Sutskever", "He", "Vaswani", "Amodei",
-  "Levine", "Krizhevsky", "Goodfellow", "Radford", "Vinyals", "Sun", "Girshick",
-  "Karpathy", "Abbeel", "Finn", "Hooker", "Gebru", "Liang", "Manning", "Wei",
-  "Devlin", "Benoliel", "Larochelle", "Wolf", "Socher", "Silver", "Jordan",
-];
+const topicAnchors = new Map(
+  topics.map((topic, i) => {
+    const angle = (i / topics.length) * Math.PI * 2;
+    const radius = 4.2 + (i % 4) * 0.35;
+    return [topic, { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius }];
+  })
+);
 
-function generateChunks(): Chunk[] {
-  const chunks: Chunk[] = [];
-  const localRng = mulberry32(123);
+const projectionBasisX = deterministicVector("projection:x");
+const projectionBasisY = deterministicVector("projection:y");
 
-  for (let i = 0; i < 500; i++) {
-    const topicIdx1 = Math.floor(localRng() * topics.length);
-    const topicIdx2 = Math.floor(localRng() * topics.length);
-    const methodIdx = Math.floor(localRng() * methods.length);
-    const resultIdx = Math.floor(localRng() * results.length);
-
-    const topic1 = topics[topicIdx1];
-    const topic2 = topics[topicIdx2];
-    const method = methods[methodIdx];
-    const result = results[resultIdx];
-
-    const year = 2018 + Math.floor(localRng() * 7);
-    const numAuthors = 2 + Math.floor(localRng() * 3);
-    const authorList: string[] = [];
-    for (let a = 0; a < numAuthors; a++) {
-      const fn = firstNames[Math.floor(localRng() * firstNames.length)];
-      const ln = lastNames[Math.floor(localRng() * lastNames.length)];
-      authorList.push(`${fn} ${ln}`);
-    }
-
-    const extraDetail = [
-      `We evaluate on ${Math.floor(localRng() * 5) + 3} benchmark datasets.`,
-      `Our model uses ${Math.floor(localRng() * 10 + 2)} layers with ${Math.floor(localRng() * 512 + 64)} hidden dimensions.`,
-      `Experiments show a ${(localRng() * 15 + 1).toFixed(1)}% improvement over the previous best.`,
-      `The training requires ${Math.floor(localRng() * 8 + 1)} GPU-hours on A100.`,
-      `We release code and pretrained weights for reproducibility.`,
-    ][Math.floor(localRng() * 5)];
-
-    const abstractText = `${method} combines ${topic1} with ${topic2} for improved performance in deep learning applications. Our approach ${result}. ${extraDetail} We further analyze ablation studies demonstrating the contribution of each component. The proposed architecture introduces a novel ${topic1}-based module that integrates seamlessly with existing ${topic2} pipelines.`;
-
-    const paperTitle = `${topic1.split(" ").map(w => w[0].toUpperCase() + w.slice(1)).join(" ")} Meets ${topic2.split(" ").map(w => w[0].toUpperCase() + w.slice(1)).join(" ")}: A Unified Framework`;
-
-    chunks.push({
-      id: `arxiv-${2000 + i}`,
-      text: abstractText,
-      embedding: embedText(abstractText),
-      source: paperTitle,
-      year,
-      authors: authorList.join(", "),
-      x: 0,
-      y: 0,
-    });
-  }
-
-  return chunks;
+function detectTopics(text: string): string[] {
+  const normalized = text.toLowerCase();
+  const matched = topics.filter((topic) =>
+    (topicAliases[topic] ?? [topic.toLowerCase()]).some((alias) => normalized.includes(alias))
+  );
+  return matched;
 }
 
-// Pre-compute UMAP-like 2D projection using random projection + topic clustering
-function computeProjection(chunks: Chunk[]): void {
-  // Two fixed random projection vectors
-  const proj1: number[] = [];
-  const proj2: number[] = [];
-  const projRng = mulberry32(999);
+function inferTopicsFromPaper(paper: ArxivPaper): string[] {
+  const textTopics = detectTopics(`${paper.title} ${paper.summary}`);
+  const categoryHints = paper.categories.flatMap((category) => categoryTopics[category] ?? []);
+  return Array.from(new Set([...textTopics, ...categoryHints])).slice(0, 6);
+}
+
+function embedSemanticText(text: string, topicHints: string[], source?: string): number[] {
+  const vec = new Array(EMBEDDING_DIM).fill(0);
+  const residual = embedTextResidual(text);
+  const titleResidual = source ? embedTextResidual(source) : null;
+
   for (let i = 0; i < EMBEDDING_DIM; i++) {
-    proj1.push(projRng() * 2 - 1);
-    proj2.push(projRng() * 2 - 1);
+    vec[i] += residual[i] * 0.55;
+    if (titleResidual) vec[i] += titleResidual[i] * 0.25;
   }
 
-  for (const chunk of chunks) {
-    let x = 0, y = 0;
-    for (let i = 0; i < EMBEDDING_DIM; i++) {
-      x += chunk.embedding[i] * proj1[i];
-      y += chunk.embedding[i] * proj2[i];
+  topicHints.forEach((topic, idx) => {
+    const basis = topicBasis.get(topic);
+    if (!basis) return;
+    const weight = idx === 0 ? 1.25 : 0.9;
+    for (let i = 0; i < EMBEDDING_DIM; i++) vec[i] += basis[i] * weight;
+  });
+
+  return normalize(vec);
+}
+
+function projectPoint(
+  embedding: number[],
+  topicHints: string[],
+  idSeed: string
+): { x: number; y: number } {
+  let x = 0;
+  let y = 0;
+
+  if (topicHints.length) {
+    for (const topic of topicHints) {
+      const anchor = topicAnchors.get(topic);
+      if (!anchor) continue;
+      x += anchor.x;
+      y += anchor.y;
     }
-    // Add some noise for spread
-    const noiseRng = mulberry32(hashStr(chunk.id));
-    x += (noiseRng() - 0.5) * 0.5;
-    y += (noiseRng() - 0.5) * 0.5;
-    chunk.x = x;
-    chunk.y = y;
+    x /= topicHints.length;
+    y /= topicHints.length;
+  }
+
+  let residualX = 0;
+  let residualY = 0;
+  for (let i = 0; i < EMBEDDING_DIM; i++) {
+    residualX += embedding[i] * projectionBasisX[i];
+    residualY += embedding[i] * projectionBasisY[i];
+  }
+
+  const noiseRng = mulberry32(hashStr(idSeed));
+  x += residualX * 0.9 + (noiseRng() - 0.5) * 0.45;
+  y += residualY * 0.9 + (noiseRng() - 0.5) * 0.45;
+
+  return { x, y };
+}
+
+function loadArxivPapers(): ArxivPaper[] {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const datasetPath = path.join(here, "data", "arxiv-ml-500.json");
+
+  try {
+    const raw = readFileSync(datasetPath, "utf8");
+    const parsed = JSON.parse(raw) as ArxivPaper[];
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      throw new Error("Dataset is empty");
+    }
+    return parsed;
+  } catch (cause) {
+    throw new Error(
+      `Missing real arXiv dataset at ${datasetPath}. Run \`npm run fetch:arxiv\` to generate it.`,
+      { cause }
+    );
+  }
+}
+
+function generateChunks(): Chunk[] {
+  return loadArxivPapers().map((paper) => {
+    const chunkTopics = inferTopicsFromPaper(paper);
+    return {
+      id: paper.id,
+      text: paper.summary,
+      embedding: embedSemanticText(paper.summary, chunkTopics, paper.title),
+      source: paper.title,
+      year: new Date(paper.published).getUTCFullYear(),
+      authors: paper.authors.join(", "),
+      topics: chunkTopics,
+      x: 0,
+      y: 0,
+    };
+  });
+}
+
+function computeProjection(chunks: Chunk[]): void {
+  for (const chunk of chunks) {
+    const point = projectPoint(chunk.embedding, chunk.topics, chunk.id);
+    chunk.x = point.x;
+    chunk.y = point.y;
   }
 }
 
 // --- Initialize dataset ---
-console.log("[Vector Lens] Generating 500 arXiv ML abstract chunks...");
+console.log("[Vector Lens] Loading real arXiv ML abstract chunks...");
 const chunks = generateChunks();
 computeProjection(chunks);
 console.log("[Vector Lens] Dataset ready. UMAP projection computed.");
+
+const chunkTokens = new Map<string, Set<string>>();
+const tokenDocumentFrequency = new Map<string, number>();
+
+for (const chunk of chunks) {
+  const tokens = new Set(tokenize(`${chunk.source} ${chunk.text}`));
+  chunkTokens.set(chunk.id, tokens);
+  for (const token of tokens) {
+    tokenDocumentFrequency.set(token, (tokenDocumentFrequency.get(token) ?? 0) + 1);
+  }
+}
+
+function lexicalScore(query: string, chunk: Chunk): number {
+  const qTokens = Array.from(new Set(tokenize(query)));
+  if (!qTokens.length) return 0;
+
+  const docTokens = chunkTokens.get(chunk.id) ?? new Set<string>();
+  let matchedWeight = 0;
+  let totalWeight = 0;
+
+  for (const token of qTokens) {
+    const df = tokenDocumentFrequency.get(token) ?? 0;
+    const idf = Math.log(1 + chunks.length / (1 + df));
+    totalWeight += idf;
+    if (docTokens.has(token)) matchedWeight += idf;
+  }
+
+  const phrase = query.trim().toLowerCase();
+  const phraseHit =
+    phrase.length > 3 && `${chunk.source} ${chunk.text}`.toLowerCase().includes(phrase)
+      ? 0.18
+      : 0;
+
+  return Math.min(1, matchedWeight / Math.max(totalWeight, 1) + phraseHit);
+}
+
+function topicOverlapScore(queryTopics: string[], chunk: Chunk): number {
+  if (!queryTopics.length) return 0;
+  let overlap = 0;
+  for (const topic of queryTopics) {
+    if (chunk.topics.includes(topic)) overlap++;
+  }
+  return overlap / queryTopics.length;
+}
 
 // --- Search tool ---
 server.tool(
@@ -231,34 +376,34 @@ server.tool(
   async ({ query, k = 5 }) => {
     const startTime = performance.now();
 
-    // Embed the query
-    const queryEmbedding = embedText(query);
+    const queryTopics = detectTopics(query);
+    const queryEmbedding = embedSemanticText(query, queryTopics, query);
+    const queryPoint = projectPoint(queryEmbedding, queryTopics, `query:${query}`);
 
-    // Compute query 2D projection
-    const projRng = mulberry32(999);
-    const proj1: number[] = [];
-    const proj2: number[] = [];
-    for (let i = 0; i < EMBEDDING_DIM; i++) {
-      proj1.push(projRng() * 2 - 1);
-      proj2.push(projRng() * 2 - 1);
-    }
-    let qx = 0, qy = 0;
-    for (let i = 0; i < EMBEDDING_DIM; i++) {
-      qx += queryEmbedding[i] * proj1[i];
-      qy += queryEmbedding[i] * proj2[i];
-    }
-
-    // Score all chunks
     const scored = chunks.map((c) => ({
       id: c.id,
       text: c.text,
       source: c.source,
       year: c.year,
       authors: c.authors,
-      similarity: Math.max(0, cosineSim(queryEmbedding, c.embedding)),
+      topics: c.topics,
+      denseScore: Math.max(0, cosineSim(queryEmbedding, c.embedding)),
+      lexicalScore: lexicalScore(query, c),
+      topicOverlap: topicOverlapScore(queryTopics, c),
       x: c.x,
       y: c.y,
-    }));
+    })).map((result) => {
+      const similarity = Math.min(
+        1,
+        result.denseScore * 0.6 +
+          result.lexicalScore * 0.28 +
+          result.topicOverlap * 0.12
+      );
+      return {
+        ...result,
+        similarity,
+      };
+    });
 
     // Sort by similarity descending
     scored.sort((a, b) => b.similarity - a.similarity);
@@ -286,6 +431,10 @@ server.tool(
         y: s.y,
         sim: parseFloat(s.similarity.toFixed(3)),
         isTopK: topKIds.has(s.id),
+        source: s.source,
+        year: s.year,
+        topics: s.topics,
+        rank: topKIds.has(s.id) ? topK.findIndex((item) => item.id === s.id) + 1 : null,
         preview: s.text.slice(0, 80),
       }));
 
@@ -298,23 +447,29 @@ server.tool(
         source: r.source,
         year: r.year,
         authors: r.authors,
+        topics: r.topics,
         similarity: parseFloat(r.similarity.toFixed(4)),
+        denseScore: parseFloat(r.denseScore.toFixed(4)),
+        lexicalScore: parseFloat(r.lexicalScore.toFixed(4)),
+        topicOverlap: parseFloat(r.topicOverlap.toFixed(4)),
       })),
       spacePoints,
-      queryPoint: { x: qx, y: qy },
+      queryPoint: { x: queryPoint.x, y: queryPoint.y, topics: queryTopics },
       stats: {
         indexSize: chunks.length,
         embeddingDim: EMBEDDING_DIM,
-        distanceMetric: "cosine" as const,
+        distanceMetric: "hybrid" as const,
         latencyMs,
         top1Sim: parseFloat(topK[0]?.similarity.toFixed(4) ?? "0"),
         topKSimGap: parseFloat(
           ((topK[0]?.similarity ?? 0) - (topK[topK.length - 1]?.similarity ?? 0)).toFixed(4)
         ),
+        scoringMode: "0.60 dense + 0.28 lexical + 0.12 topic prior",
+        matchedTopics: queryTopics,
       },
       histBins,
-      modelName: "all-MiniLM-L6-v2",
-      datasetName: "arXiv ML Abstracts",
+      modelName: "Hybrid semantic + lexical ranker",
+      datasetName: "Real arXiv ML Abstracts",
     };
 
     const summaryLines = topK

@@ -17,7 +17,8 @@
     "build": "mcp-use build",
     "dev": "mcp-use dev",
     "start": "mcp-use start",
-    "deploy": "mcp-use deploy"
+    "deploy": "mcp-use deploy",
+    "fetch:arxiv": "tsx scripts/fetch-arxiv.ts"
   },
   "dependencies": {
     "@mcp-use/cli": "https://pkg.pr.new/@mcp-use/cli@1253",
